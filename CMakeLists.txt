@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.14)
+project(cpp_ftp)
+
+set(CMAKE_CXX_STANDARD 20)
+include_directories(/usr/local/include)
+add_executable(cpp_ftp main.cpp argparse.hpp globals.hpp netbuffer.hpp ftp.hpp utils.hpp ftptransfer.h)
+add_subdirectory(filesystem)
+find_library(SOCKPP sockpp)
+target_link_libraries(cpp_ftp ghc_filesystem)
+target_link_libraries(cpp_ftp "${SOCKPP}")
