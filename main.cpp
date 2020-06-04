@@ -21,18 +21,22 @@
 // rfc 959 compliant
 #include "ftp.hpp"
 
+// all available commands for the ftp server
+// command - function map
+// so when we receive a command we just call it from this map
 const std::unordered_map<std::string,
                    std::function<response(FTP&, const std::string)>>
                    funcMap = {{"USER", userFTP}, {"PASS", passFTP}, {"REIN", reinFTP}, {"QUIT", quitFTP},
-							  {"TYPE", typeFTP}, {"MODE", modeFTP}, {"STRU", struFTP},
-							  {"PASV", pasvFTP}, {"PORT", portFTP},
-							  {"PWD", pwdFTP}, {"CWD", cwdFTP}, {"CDUP", cdupFTP}, {"MKD", mkdFTP}, {"LIST", listFTP}};
+							  {"TYPE", typeFTP}, {"MODE", modeFTP}, {"STRU", struFTP}, {"SYST", systFTP},
+							  {"PASV", pasvFTP}, {"PORT", portFTP}, {"HELP", helpFTP}, {"NOOP", noopFTP},
+							  {"PWD", pwdFTP}, {"CWD", cwdFTP}, {"CDUP", cdupFTP}, {"MKD", mkdFTP}, {"LIST", listFTP},
+							  {"STOR", storFTP}, {"RETR", retrFTP}};
 
 
 void runFtpPI(stringHashMap users_t, sockpp::tcp_socket sock, sockpp::inet_address peer, fs::path workdir, loggerT& logger) {
 	FTP ftp(users_t, std::move(sock), peer, workdir, logger);
 	// send 220 code since we are ready for working
-	sendReply(ftp, 220, "Ready for service, waiting for authorization");
+	sendReply(ftp, 220, "Ready for service, waiting for authorization. HELP command lists available commands");
 
 	// wait for commands from user
 	do {
@@ -122,6 +126,12 @@ int main(int argc, char* argv[]) {
 		}
 		return result;
 	}();
+
+	// if we don't have any valid users then quit
+	if (users.empty()) {
+		std::cerr << "No valid users, nobody will be able to login. Specify users in the \"" << defaultUserFile << "\" file" << std::endl;
+		return 1;
+	}
 
 	// if the server root directory isn't created, make it
 	fs::path workDirectory(dirPath);

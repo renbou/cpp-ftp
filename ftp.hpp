@@ -6,6 +6,7 @@
 #include <sockpp/tcp_connector.h>
 #include <sockpp/inet_address.h>
 #include <algorithm>
+#include <fstream>
 #include "globals.hpp"
 #include "utils.hpp"
 #include "netbuffer.hpp"
@@ -15,13 +16,23 @@
 struct FTP {
 	// control connection and data connection as specified in rfc 959
 	sockpp::tcp_socket controlSock;
+	// we need to store the passive socket separately cause we need to listen and accept on it multiple times
+	// after we accepted we just write the socket to dataSocket
 	sockpp::tcp_acceptor pasvSock;
+	// if we are using an active data connection (server connects to client)
+	// then we use tcp_connector and then store the socket here
 	sockpp::tcp_socket dataSocket;
+	// we need to store the control connection peer for logging
+	// and data socket peer for error logging
 	sockpp::inet_address peer, dataSockAddr;
+	// logger class
+	// if we don't have logging to file enabled then we don't need to worry
+	// because logger handles it on its own
 	loggerT &logger;
 	// server root directory path and current path
 	fs::path serverRoot, workDir, curDir;
-	stringHashMap users;
+	// we store the valid users in this map so we can authenticate easily
+	stringHashMap &users;
 	// the buffer of the ftp control socket
 	netbuffer ftpBuf;
 
@@ -41,9 +52,9 @@ struct FTP {
 	enum FTPSTRU {FILE} ftpFormatStru = FILE;
 
 
-	FTP(stringHashMap users_t, sockpp::tcp_socket controlSock_t, sockpp::inet_address peer_t, fs::path workDir_t, loggerT &logger_t)
-		: logger(logger_t), ftpBuf() {
-		users = users_t;
+	// we use std::move to move unique_ptr type variables that can't be copied
+	FTP(stringHashMap &users_t, sockpp::tcp_socket controlSock_t, sockpp::inet_address peer_t, fs::path workDir_t, loggerT &logger_t)
+		: logger(logger_t), ftpBuf(), users(users_t) {
 		controlSock = std::move(controlSock_t);
 		curDir = workDir = workDir_t;
 		serverRoot = workDir.parent_path();
@@ -77,14 +88,36 @@ const bool sendReply(FTP& ftp, uint32_t code, std::string str) {
 	return sendString(ftp, std::to_string(code) + " " + str + CRLF);
 }
 
-// helper function for sending buffer to socket
-const bool sendBuf(FTP& ftp, dataT &buffer) {
-	if (ftp.controlSock.write_n(buffer.data(), buffer.size()) < buffer.size())
-		return shutdownError(ftp, "error while sending data");
-	return false;
+// function to setup the data connection
+const std::tuple<bool, int32_t, std::string> initDataConnection(FTP &ftp) {
+	// if we have passive mode enabled
+	if (ftp.passiveMode) {
+		ftp.dataSocket = ftp.pasvSock.accept(&ftp.dataSockAddr);
+		// can't connect
+		if (not ftp.dataSocket) {
+			ftp.logger << getPeer(ftp) << " - error accepting passive connection from " << ftp.dataSockAddr.to_string() <<
+					   ": " << ftp.dataSocket.last_error_str() << ENDL;
+			ftp.dataSocket.close();
+			return {true, 425, "Error accepting connection"};
+		}
+	} else {
+		sockpp::tcp_connector dataConnection(ftp.dataSockAddr);
+		// can't connect
+		if (not dataConnection) {
+			ftp.logger << getPeer(ftp) << " - error making data connection to " << ftp.dataSockAddr.to_string() <<
+					   ": " << dataConnection.last_error_str() << ENDL;
+			dataConnection.close();
+			return {true, 425, "Error making connection"};
+		}
+		ftp.dataSocket = std::move(dataConnection);
+	}
+	return {false, 225, "Data connection successfully established"};
 }
 
 // helper function to validate path
+// tries to get the canonical path and then the absolute path
+// and then checks if the path starts with the serverRoot path
+// this is secure, we can't go out of our secure directory
 const std::pair<fs::path, bool> getPath(FTP &ftp, std::string path) {
 	// replace all backslashes
 	std::replace(path.begin(), path.end(), '\\', '/');
@@ -107,11 +140,35 @@ const std::pair<fs::path, bool> getPath(FTP &ftp, std::string path) {
 }
 
 // helper function to check if user is logged in
+// we don't support anonymous FTP connection without a password
+// because it isn't a necessity
 const bool isAuthed(FTP& ftp) {
 	return ftp.user.first != "" and ftp.user.second != "";
 }
 
+// ftp noop
+// doesn't do anything
+const response noopFTP(FTP &ftp, const std::string command) {
+	return {200, "NOOP"};
+}
+
+// ftp help
+// sends multiline reply of available commands and help message
+const response helpFTP(FTP &ftp, const std::string command) {
+	const auto [tmp1, tmp2] = getNextParam(command);
+	if (tmp1 != "")
+		return {502, "HELP command can't have any params"};
+	sendString(ftp, "214-HELP message for server" + CRLF);
+	sendString(ftp, "FTP server " + serverVersion + " based on RFC 959" + CRLF);
+	for (auto message: commandHelp)
+		sendString(ftp, message.first + " - " + message.second + CRLF);
+	return {214, "HELP message for server"};
+}
+
 // function to handle USER
+// USER [username] tries to begin authentication with the specified username
+// if the username is invalid then the process must start again
+// susceptible to username enumeration through bruteforce
 const response userFTP(FTP &ftp, const std::string command) {
 	// invalidate the user as specified in RFC 959
 	ftp.user = {};
@@ -131,6 +188,9 @@ const response userFTP(FTP &ftp, const std::string command) {
 }
 
 // function to handle PASS
+// PASS [password] tries to authenticate the user after the username has been specified with USER command
+// if incorrect then the process must start again
+// no bruteforce protection because that shouldn't be the worries of the server
 const response passFTP(FTP &ftp, const std::string command) {
 	// PASS must be preceded by USER, otherwise it's incorrect
 	if (ftp.prevCommand != "USER") {
@@ -163,15 +223,18 @@ const response passFTP(FTP &ftp, const std::string command) {
 }
 
 // function to handle REIN
+// REIN logs out the user, allowing a new user to login on the same control connection
 const response reinFTP(FTP &ftp, const std::string command) {
 	const auto [tmp1, tmp2] = getNextParam(command);
 	if (tmp1 != "")
 		return {501, "REIN can't have params"};
+	ftp.logger << getPeer(ftp) << " - user \"" << ftp.user.first << "\" signed out" << ENDL;
 	ftp.user = {};
 	return {220, "Server ready for new user"};
 }
 
 // handle FTP quit
+// QUIT just stops the control connection
 const response quitFTP(FTP &ftp, const std::string command) {
 	const auto [param1, leftover] = getNextParam(command);
 	if (param1 != "" or leftover != "")
@@ -183,6 +246,7 @@ const response quitFTP(FTP &ftp, const std::string command) {
 
 // handle FTP pwd
 // we create a fake filesystem where we are in /$workdir and can't go up
+// PWD prints the current directory (starting from the server root)
 const response pwdFTP(FTP &ftp, const std::string command) {
 	if (not isAuthed(ftp))
 		return {530, "PWD command requires an authenticated session"};
@@ -195,7 +259,8 @@ const response pwdFTP(FTP &ftp, const std::string command) {
 
 // handle FTP type
 // ASCII and binary format are pretty much indifferent nowadays
-// however with ascii mode we can't send files which aren't in ascii 7-bit range
+// ASCII used to support different newline sequences but nowadays it doesn't matter
+// so we don't need to convert CRLF to LF and vice-versa
 const response typeFTP(FTP &ftp, const std::string command) {
 	if (not isAuthed(ftp))
 		return {530, "TYPE command requires an authenticated session"};
@@ -220,7 +285,8 @@ const response typeFTP(FTP &ftp, const std::string command) {
 }
 
 // handle FTP mode
-// we only support block and stream mode
+// we only support stream mode
+// MODE [MODE]
 const response modeFTP(FTP &ftp, const std::string command) {
 	if (not isAuthed(ftp))
 		return {530, "MODE command requires authenticated session"};
@@ -248,6 +314,12 @@ const response struFTP(FTP &ftp, const std::string command) {
 }
 
 // handle FTP pasv
+// PASV requests passive data connection
+// the return is a code and the connection in the form ip1, ip2, ip3, ip4, port1, port2
+// which the client transforms into ip1.ip2.ip3.ip4:port1*256+port
+// the client must connect to the specified connection for data transfer commands
+// YOU SHOULDN'T rely on the ip1.ip2.ip3.ip4 for connections and should use the server's actual IP
+// because the server listens on ALL network interfaces
 const response pasvFTP(FTP &ftp, const std::string command) {
 	if (not isAuthed(ftp))
 		return {530, "PASV command requires an authenticated session"};
@@ -279,6 +351,10 @@ const response pasvFTP(FTP &ftp, const std::string command) {
 }
 
 // handle FTP port
+// PORT ip1, ip2, ip3, ip4, port1, port2
+// specifies the active connection address as ip1.ip2.ip3.ip4:port1*256+port
+// as specified in RFC 959
+// the client must listen on this address for data connections
 const response portFTP(FTP &ftp, const std::string command) {
 	if (not isAuthed(ftp))
 		return {530, "PORT command requires an authenticated session"};
@@ -287,20 +363,34 @@ const response portFTP(FTP &ftp, const std::string command) {
 	if (leftover != "")
 		return {501, "PORT command accepts only one argument"};
 	// close passive connection if it is open
-	if (ftp.pasvSock.is_open()) {
+	if (ftp.pasvSock.is_open() || ftp.passiveMode) {
 		ftp.passiveMode = false;
 		ftp.pasvSock.shutdown();
 		ftp.pasvSock.close();
 	}
 
 	auto tokens = splitByDelim(address, ",");
-	ftp.dataSockAddr = sockpp::inet_address(tokens[0] + "." + tokens[1] + "." + tokens[2] + "." + tokens[3],
-											std::stoi(tokens[4]) * 256 + std::stoi(tokens[5]));
+	// we must correctly check that there are 6 values specified and that they are all numbers
+	// simply check by converting to number and back to string
+	const auto checkInt = [](const std::string &value) -> std::string {
+		return std::to_string(std::stoi(value));
+	};
+	if (tokens.size() != 6)
+		return {501, "PORT command must be in form ip1, ip2, ip3, ip4, port1, port2. Check RFC 959"};
+	try {
+		ftp.dataSockAddr = sockpp::inet_address(checkInt(tokens[0]) + "." + checkInt(tokens[1]) + "."
+			   									+ checkInt(tokens[2]) + "." + checkInt(tokens[3]),
+												std::stoi(tokens[4]) * 256 + std::stoi(tokens[5]));
+	} catch (std::exception &e) {
+		return {501, "Invalid parameters for PORT command. Check RFC 959"};
+	}
 	ftp.logger << getPeer(ftp) << " - user initialized port - " << ftp.dataSockAddr.to_string() << ENDL;
 	return {200, "Data connection port set successfully to " + ftp.dataSockAddr.to_string()};
 }
 
 // handle FTP cwd
+// CWD [PATH] tries to change the working directory to PATH
+// we don't actually cd anywhere, we just change the curDir variable in the class
 const response cwdFTP(FTP &ftp, const std::string command) {
 	if (not isAuthed(ftp))
 		return {530, "CWD command requires an authenticated session"};
@@ -315,11 +405,13 @@ const response cwdFTP(FTP &ftp, const std::string command) {
 }
 
 // handle FTP cdup, just call cwd with .. parameter
+// CDUP goes up one directory, but it's basically cwd ..
 const response cdupFTP(FTP &ftp, const std::string command) {
 	return cwdFTP(ftp, ".. " + command);
 }
 
 // handle FTP mkd
+// MKD [PATH] tries to create the directories in PATH
 const response mkdFTP(FTP &ftp, const std::string command) {
 	if (not isAuthed(ftp))
 		return {530, "MKD command requires an authenticated session"};
@@ -336,48 +428,55 @@ const response mkdFTP(FTP &ftp, const std::string command) {
 	return {200, "Directory created"};
 }
 
+// handle FTP SYST
+// let's just fake our server type and always say we are on linux
+const response systFTP(FTP &ftp, const std::string command) {
+	return {200, "UNIX Type: L8"};
+}
+
 // handle FTP LIST
+// LIST [PATH/-a]
+// LIST -a/-al/-la prints "verbose" output with . and ..
+// default LIST sends the directory listing to the data connection
 const response listFTP(FTP &ftp, const std::string command) {
 	if (not isAuthed(ftp))
 		return {530, "LIST command requires an authenticated session"};
-	auto [path, tmp2] = getNextParam(command);
+	const auto [path, tmp2] = getNextParam(command);
 	if (tmp2 != "")
 		return {501, "LIST command can't have extra params"};
 	fs::path requestPath = ftp.curDir;
-	if (path != "") {
+	// the path isn't actually a request to send verbose output then check file permissions
+	if (path != "-a" and path != "-al" and path != "-la") {
 		// check if we have access to this path
-		const auto [resPath, error] = getPath(ftp, path);
-		if (error)
-			return {550, "Invalid path or no access"};
-		requestPath = resPath;
-	}
-	// if we have passive mode enabled
-	if (ftp.passiveMode) {
-		ftp.dataSocket = ftp.pasvSock.accept(&ftp.dataSockAddr);
-		// can't connect
-		if (not ftp.dataSocket) {
-			ftp.logger << getPeer(ftp) << " - error accepting passive connection from " << ftp.dataSockAddr.to_string() <<
-						  ": " << ftp.dataSocket.last_error_str() << ENDL;
-			ftp.dataSocket.close();
-			return {425, "Error accepting connection"};
+		if (path != "") {
+			const auto[resPath, error] = getPath(ftp, path);
+			if (error or not fs::exists(resPath))
+				return {550, "Invalid path or no access"};
+			requestPath = resPath;
 		}
-	} else {
-		sockpp::tcp_connector dataConnection(ftp.dataSockAddr);
-		// can't connect
-		if (not dataConnection) {
-			ftp.logger << getPeer(ftp) << " - error making data connection to " << ftp.dataSockAddr.to_string() <<
-						  ": " << dataConnection.last_error_str() << ENDL;
-			dataConnection.close();
-			return {425, "Error making connection"};
-		}
-		ftp.dataSocket = std::move(dataConnection);
 	}
+	// try to establish data connection
+	const auto [connectionError, connectionCode, errorString] = initDataConnection(ftp);
+	// couldn't successfully connect for data transmission
+	if (connectionError)
+		return {connectionCode, errorString};
 	ftp.logger << getPeer(ftp) << " - data connection opened for directory listing of " << ftp.curDir.generic_string() << ENDL;
 	// successfully opened connection, send good code
-	//sendReply(ftp, 125, "Opened connection, about to begin transfer of directory listing");
+	sendReply(ftp, 125, "Opened connection, about to begin transfer of directory listing");
 	streamTransferWriter listWriter;
+	// if we requested verbose output then send classic . and .. directories
+	if (path == "-a" or path == "-al" or path == "-la") {
+		// error during writing
+		if (listWriter.write(ftp.dataSocket, listVerboseData)) {
+			ftp.logger << getPeer(ftp) << " - error during sending data: " << ftp.dataSocket.last_error_str() << ENDL;
+			ftp.dataSocket.shutdown();
+			ftp.dataSocket.close();
+			return {426, "Error during dir listing transmission"};
+		}
+	}
 	for (auto entry: fs::directory_iterator(requestPath)) {
-		const std::string currentName = getFilePerms(entry.path()) + " " + entry.path().filename().generic_string() + CRLF;
+		const std::string currentName = getFilePerms(entry.path()) + " " +
+										std::to_string(fs::file_size(entry.path())) + "b " + entry.path().filename().generic_string() + CRLF;
 		const dataT currentNameData(currentName.begin(), currentName.end());
 		// error happened during writing
 		if (listWriter.write(ftp.dataSocket, currentNameData)) {
@@ -398,6 +497,121 @@ const response listFTP(FTP &ftp, const std::string command) {
 	ftp.dataSocket.close();
 	ftp.logger << getPeer(ftp) << " - directory listing was successful, sent all data" << ENDL;
 	return {226, "Successfully transferred directory listing"};
+}
+
+// handle FTP STOR
+// STOR [PATH] tries to write the file to path
+// only writes if we have access to this path and if the path points to a file in an existing folder
+const response storFTP(FTP &ftp, const std::string command) {
+	if (not isAuthed(ftp))
+		return {530, "STOR command requires an authenticated session"};
+	auto [path, tmp2] = getNextParam(command);
+	if (tmp2 != "")
+		return {501, "STOR command can't have extra params"};
+	if (path == "")
+		return {501, "You have to specify result filename or path"};
+	const auto [resPath, pathError] = getPath(ftp, path);
+	// if the path is illegal or if the path to the file doesn't exist then we can't write
+	if (pathError or not fs::exists(resPath.parent_path()))
+		return {550, "Invalid file path"};
+	// if the specified filename/path points to directory then we can't convert it to a file
+	if (fs::exists(resPath) and fs::is_directory(resPath))
+		return {550, "Invalid file path"};
+	// the filepath is correct, we can write to it
+	// try to establish data connection
+	const auto [connectionError, connectionCode, errorString] = initDataConnection(ftp);
+	// couldn't successfully connect for data transmission
+	if (connectionError)
+		return {connectionCode, errorString};
+	sendReply(ftp, 125, "Beginning file transfer");
+	try {
+		ftp.logger << getPeer(ftp) << " - user stored file " << resPath.generic_string() << ENDL;
+		// open the file in binary output mode and write blocks of bytes
+		std::ofstream file(resPath.generic_string(), std::ofstream::binary);
+		// initialize the local buffer
+		netbuffer localNetbuff;
+		// try to get data and write to file while we can
+		while (true) {
+			const dataT block = read(ftp.dataSocket, localNetbuff);
+			// if the block is empty then finish reading
+			if (block.empty())
+				break;
+			// write the block to the file
+			file.write((char *)block.data(), block.size());
+		}
+		file.close();
+		ftp.dataSocket.shutdown();
+		ftp.dataSocket.close();
+		return {226, "Successful file transfer"};
+	} catch (std::exception &e) {
+		ftp.logger << getPeer(ftp) << " - Error trying to write to file (STOR): " << resPath.generic_string() << " : " << e.what();
+		return {426, "Error during storing the file"};
+	}
+}
+
+// handle FTP RETR
+// RETR [PATH] tries to retrieve requested file
+const response retrFTP(FTP &ftp, const std::string command) {
+	if (not isAuthed(ftp))
+		return {530, "STOR command requires an authenticated session"};
+	auto [path, tmp2] = getNextParam(command);
+	if (tmp2 != "")
+		return {501, "STOR command can't have extra params"};
+	if (path == "")
+		return {501, "You have to specify requested filename or path"};
+	const auto [resPath, pathError] = getPath(ftp, path);
+	// if the path is illegal or if the path to the file doesn't exist then we can't write
+	if (pathError or not fs::exists(resPath))
+		return {550, "Invalid file path"};
+	// if the specified filename/path points to directory then we can't send it as a file
+	if (fs::exists(resPath) and fs::is_directory(resPath))
+		return {550, "Invalid file path"};
+	// the file exists so we could try sending it
+	// try to establish data connection
+	const auto [connectionError, connectionCode, errorString] = initDataConnection(ftp);
+	// couldn't successfully connect for data transmission
+	if (connectionError)
+		return {connectionCode, errorString};
+	sendReply(ftp, 125, "Beginning file transfer");
+	try {
+		ftp.logger << getPeer(ftp) << " - user requested file " << resPath.generic_string() << ENDL;
+		// open the file in binary output mode and write blocks of bytes
+		std::ifstream file(resPath.generic_string(), std::ofstream::binary);
+		// initialize the streamwriter class
+		streamTransferWriter localWriter;
+		// local buffer for reading
+		dataT buffer;
+		buffer.reserve(BUFSIZE);
+		// try to get read data and send
+		while (not file.eof()) {
+			file.read(reinterpret_cast<char *>(buffer.data()), BUFSIZE);
+			const int32_t numRead = file.gcount();
+			// we read zero bytes so lets just quit
+			if (!numRead)
+				break;
+			// error happens during sending data
+			if (localWriter.write(ftp.dataSocket, buffer)) {
+				file.close();
+				ftp.dataSocket.shutdown();
+				ftp.dataSocket.close();
+				return {426, "Error during file transmission"};
+			}
+		}
+		// try flushing the rest of the data
+		if (localWriter.buffer.size() != 0 and localWriter.flush(ftp.dataSocket)) {
+			file.close();
+			ftp.dataSocket.shutdown();
+			ftp.dataSocket.close();
+			return {426, "Error during file transmission"};
+		}
+		file.close();
+		ftp.dataSocket.shutdown();
+		ftp.dataSocket.close();
+		return {226, "Successful file transfer"};
+	} catch (std::exception &e) {
+		ftp.logger << getPeer(ftp) << " - Error trying to read from file (RETR): " << resPath.generic_string() << " : " << e.what();
+		return {426, "Error during retrieving the file"};
+	}
 }
 
 #endif //CPP_FTP_FTP_HPP

@@ -13,8 +13,11 @@ namespace fs = ghc::filesystem;
 enum loggerEndl {ENDL};
 
 // logger class which outputs to stdout as well to log
+// if we don't supply a log file name then we simply set the logfile ptr to nullptr
 struct loggerT {
 
+	// unique_ptr for easier checking
+	// also it will automatically close on really bad errors
 	std::unique_ptr<std::ofstream> logFile;
 
 	loggerT(const std::string logFileName) {
@@ -35,6 +38,8 @@ struct loggerT {
 		return *this;
 	}
 
+	// only accept the specific ENDL value
+	// send std::endl to both streams, effectively flushing them
 	loggerT& operator<<(const loggerEndl) {
 		std::cout << std::endl;
 		if (logFile)
@@ -42,6 +47,7 @@ struct loggerT {
 		return *this;
 	}
 
+	// correctly handle the closing of required file
 	void close() {
 		if (logFile)
 			logFile->close();
@@ -56,6 +62,7 @@ const std::pair<std::string, std::string> getNextParam(const std::string str) {
 	return {str.substr(0, pos), str.substr(pos + 1)};
 }
 
+// recursively splits a string into vector by delimiter
 const std::vector<std::string> splitByDelim(std::string str, std::string delim) {
 	if (str == "")
 		return {};
@@ -68,6 +75,8 @@ const std::vector<std::string> splitByDelim(std::string str, std::string delim) 
 	return tmp;
 }
 
+// returns a string of file permissions
+// linux-like way
 const std::string getFilePerms (fs::path path) {
 	const fs::file_status fileStat = fs::status(path);
 	const fs::perms filePerms = fileStat.permissions();
