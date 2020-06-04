@@ -576,7 +576,7 @@ const response retrFTP(FTP &ftp, const std::string command) {
 	try {
 		ftp.logger << getPeer(ftp) << " - user requested file " << resPath.generic_string() << ENDL;
 		// open the file in binary output mode and write blocks of bytes
-		std::ifstream file(resPath.generic_string(), std::ofstream::binary);
+		fs::ifstream file(resPath.generic_string(), std::ofstream::binary);
 		// initialize the streamwriter class
 		streamTransferWriter localWriter;
 		// local buffer for reading
@@ -589,6 +589,7 @@ const response retrFTP(FTP &ftp, const std::string command) {
 			// we read zero bytes so lets just quit
 			if (!numRead)
 				break;
+			buffer.assign(buffer.data(), buffer.data() + numRead);
 			// error happens during sending data
 			if (localWriter.write(ftp.dataSocket, buffer)) {
 				file.close();
@@ -596,6 +597,7 @@ const response retrFTP(FTP &ftp, const std::string command) {
 				ftp.dataSocket.close();
 				return {426, "Error during file transmission"};
 			}
+			buffer.clear();
 		}
 		// try flushing the rest of the data
 		if (localWriter.buffer.size() != 0 and localWriter.flush(ftp.dataSocket)) {
